@@ -36,6 +36,8 @@ const HEADER_NAME = /^(featured |daily )?(entrees?|vegetables?|fruits?|sides?|gr
 // Everyday staples (sunbutter & jelly sandwiches, bread rolls) stay in the notes but don't crowd
 // the event title. "Egg Roll" and "Spring Roll" are mains, so only bread-type rolls match.
 const TITLE_SKIP = /^(SBJ|WBJ|PBJ) Sandwich$|\b(dinner|bread|wheat|whole grain|wg|hawaiian) roll$/i;
+// Preschool / 3-5 year old serving lines, kept out of the feed (see cafeteriaLineList loop).
+const SKIP_LINE = /\b\d\s*-\s*\d year old\b|\bpre-?k\b|\bpre-?school\b/i;
 
 export default {
   async fetch(request, env, ctx) {
@@ -251,6 +253,9 @@ async function fetchMenu(config) {
     const items = [];
     let theme = null;
     for (const line of block.cafeteriaLineList?.data ?? []) {
+      // Skip a separate preschool / 3-5 year old serving line some elementary schools list,
+      // so the feed shows the regular menu rather than mixing in the little-kids' line.
+      if (SKIP_LINE.test(cleanText(line.name))) continue;
       for (const item of line.foodItemList?.data ?? []) {
         const name = cleanText(item.item_Name);
         const themeMatch = name.match(/^\*(.+)\*$/); // e.g. "*HOLIDAY MEAL!*"
