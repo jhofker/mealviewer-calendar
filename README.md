@@ -246,6 +246,40 @@ Forgot a menu's exact name? Open your Worker's address with `/menus` on the end 
 
 **Set this up before the multi-calendar version?** A `wrangler.toml` with `MEAL` directly under `[vars]` and no `FEEDS` still works and serves `/lunch.ics`. Switch to `FEEDS` when you want a second calendar. Keep a feed named `lunch` and your existing link keeps working.
 
+## Also push to Skylight Meals (optional)
+
+The feeds above put lunches on your **calendar**. Skylight also has a separate **Meals** planner, and this Worker can mirror each feed's menu into it on a schedule — so the same lunches show under Meals, not just on the calendar board. The calendar feeds keep working on their own; this is extra.
+
+It talks to Skylight through its **unofficial** API (the same one the Skylight apps use — there's no public one), so it can break if Skylight changes how its app signs in. If the scheduled push starts failing, that's the usual cause.
+
+### Turn it on
+
+1. Store your Skylight login as Worker secrets, so it stays out of the repo:
+
+   ```bash
+   npx wrangler secret put SKYLIGHT_EMAIL
+   npx wrangler secret put SKYLIGHT_PASSWORD
+   ```
+
+2. Add a schedule to `wrangler.toml`. Each run pushes the next ~35 days, so once a week is plenty:
+
+   ```toml
+   [triggers]
+   crons = ["0 11 * * SUN"]   # Sundays 11:00 UTC
+   ```
+
+3. Deploy with `npm run deploy`.
+
+On each run the Worker logs in, reads your upcoming menus, and writes one meal per school day into the Skylight category that matches the feed's meal: a lunch feed lands in **Lunch**, a breakfast feed in **Breakfast**, and so on. The entries use the same titles as the calendar, like **🍽 Lincoln Lunch: Chicken Tenders**.
+
+### Good to know
+
+- **Re-runs are safe.** Entries are matched by their title prefix, so each run refreshes only the meals this Worker created and never touches ones you added in Skylight by hand.
+- **Your frame is found automatically** when the account has a single Skylight frame (board). If you have more than one, set `SKYLIGHT_FRAME_ID` (a `[vars]` value or a secret) to the id from the Skylight web app's URL.
+- **Out of cron slots?** Cloudflare's free plan allows 5 cron triggers per account. If you're at the limit, free one up — or run the sync yourself with `node scripts/sync-skylight.mjs`, which reads `SKYLIGHT_EMAIL`, `SKYLIGHT_PASSWORD`, `TIMEZONE`, and `FEEDS` (the same JSON as your `[vars.FEEDS]`) from the environment.
+
+> Not affiliated with Skylight. This uses the same private API the Skylight apps call; it isn't documented or supported by Skylight.
+
 ## A note on privacy
 
 Anyone who has your calendar link can see that menu. The link also includes your Cloudflare account name and your feed names. The menus are public on MealViewer anyway, but if you share screenshots or code, leave the links out. If you'd rather not have kids' names in links, name the feeds something like `kid1-lunch` and use `CALENDAR_NAME` for the friendly name.
