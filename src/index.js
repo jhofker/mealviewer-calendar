@@ -110,6 +110,17 @@ export default {
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   },
+
+  // Cron trigger: mirror each feed's menu into the Skylight Meals planner, if configured.
+  // No-op (so ICS-only deployments are unaffected) unless Skylight credentials are set.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      syncSkylight(env).then(
+        (result) => console.log("Skylight sync:", JSON.stringify(result)),
+        (err) => console.error("Skylight sync failed:", err?.stack || err),
+      ),
+    );
+  },
 };
 
 // Returns a Map of feed name -> settings. Feeds inherit the top-level SCHOOL_ID, SCHOOL_NAME and
@@ -289,6 +300,22 @@ async function fetchMenu(config) {
   return days;
 }
 
+// The event/meal title: the entrées (minus everyday staples), falling back through the other
+// groups so a day that's only fruit still gets a title. Prefixed with any theme ("Holiday Meal").
+function dayTitle({ theme, groups }) {
+  const mains = groups.ENTREES.filter((name) => !TITLE_SKIP.test(name));
+  const dishes = [mains, ...Object.values(groups)].find((items) => items.length).join(" / ");
+  return theme ? `${theme} ${dishes}` : dishes;
+}
+
+// The full breakdown: one "Label: a, b, c" line per non-empty group, in KEEP_TYPES order.
+function dayDescription({ groups }) {
+  return Object.entries(KEEP_TYPES)
+    .filter(([type]) => groups[type].length)
+    .map(([type, label]) => `${label}: ${groups[type].join(", ")}`)
+    .join("\n");
+}
+
 function buildCalendar(days, { feedName, schoolId, timezone, calendarName, eventPrefix }) {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
   const lines = [
@@ -303,17 +330,12 @@ function buildCalendar(days, { feedName, schoolId, timezone, calendarName, event
     "X-PUBLISHED-TTL:PT6H",
   ];
 
-  for (const { date, theme, groups } of days) {
+  for (const day of days) {
+    const { date } = day;
     const ymd = date.replace(/-/g, "");
     const next = addDays(date, 1).replace(/-/g, "");
-    const mains = groups.ENTREES.filter((name) => !TITLE_SKIP.test(name));
-    // Fall back through the groups so a snack that's only fruit still gets a title.
-    const dishes = [mains, ...Object.values(groups)].find((items) => items.length).join(" / ");
-    const title = theme ? `${theme} ${dishes}` : dishes;
-    const description = Object.entries(KEEP_TYPES)
-      .filter(([type]) => groups[type].length)
-      .map(([type, label]) => `${label}: ${groups[type].join(", ")}`)
-      .join("\n");
+    const title = dayTitle(day);
+    const description = dayDescription(day);
 
     lines.push(
       "BEGIN:VEVENT",
@@ -386,4 +408,237 @@ function addDays(ymd, n) {
 function mdy(ymd) {
   const [y, m, d] = ymd.split("-");
   return `${m}-${d}-${y}`;
+}
+
+// ---------------------------------------------------------------------------
+// Skylight Meals push (optional). The ICS feeds above are the primary output; this
+// additionally mirrors each feed's menu into the Skylight Meals planner via Skylight's
+// unofficial API, so lunches show in the Meals view as well as the calendar.
+//
+// Enabled only when SKYLIGHT_EMAIL + SKYLIGHT_PASSWORD (or SKYLIGHT_ACCESS_TOKEN, mainly
+// for testing) are set. Each feed lands in the Skylight meal category matching its meal
+// word (lunch -> "Lunch"). Entries we created are recognised by their title prefix (e.g.
+// "🍽 Adams Lunch:"), so re-runs replace our own stale entries and never touch meals you
+// added by hand. The API is unofficial and may change without notice.
+// ---------------------------------------------------------------------------
+
+const SKYLIGHT_BASE = "https://app.ourskylight.com";
+const SKYLIGHT_CLIENT_ID = "skylight-mobile";
+const SKYLIGHT_REDIRECT_URI = "skylight-family://welcome";
+const SKYLIGHT_SCOPE = "everything";
+const SKYLIGHT_API_VERSION = "2026-10-15";
+const SKYLIGHT_BROWSER_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+// Our meal word -> the Skylight category label it maps to.
+const SKYLIGHT_CATEGORY = { Lunch: "Lunch", Breakfast: "Breakfast", Snack: "Snack", Supper: "Dinner" };
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function b64url(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// A minimal per-host cookie jar, so the login session survives the redirect chain.
+function makeJar() {
+  const hosts = new Map();
+  return {
+    store(url, res) {
+      const host = new URL(url).host;
+      const set = res.headers.getSetCookie?.() ?? [];
+      if (!set.length) return;
+      const m = hosts.get(host) ?? new Map();
+      for (const c of set) {
+        const pair = c.split(";")[0];
+        const i = pair.indexOf("=");
+        if (i > 0) m.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+      }
+      hosts.set(host, m);
+    },
+    header(url) {
+      const m = hosts.get(new URL(url).host);
+      return m && m.size ? [...m].map(([k, v]) => `${k}=${v}`).join("; ") : "";
+    },
+  };
+}
+
+// Log in with the OAuth2 Authorization-Code + PKCE flow the Skylight apps use (the legacy
+// email/password /api/sessions endpoint is retired). Returns the access token.
+async function skylightLogin(email, password) {
+  const jar = makeJar();
+  const go = async (method, url, { headers = {}, body } = {}) => {
+    const cookie = jar.header(url);
+    const res = await fetch(url, {
+      method,
+      headers: { "User-Agent": SKYLIGHT_BROWSER_UA, ...(cookie ? { Cookie: cookie } : {}), ...headers },
+      body,
+      redirect: "manual",
+    });
+    jar.store(url, res);
+    return res;
+  };
+  const absolute = (loc) => (loc.startsWith("http") ? loc : SKYLIGHT_BASE + loc);
+
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = b64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(18)));
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: SKYLIGHT_CLIENT_ID,
+    redirect_uri: SKYLIGHT_REDIRECT_URI,
+    scope: SKYLIGHT_SCOPE,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    prompt: "login",
+  });
+
+  // 1. Load the login form (following any http redirects), and read its CSRF token.
+  let res = await go("GET", `${SKYLIGHT_BASE}/oauth/authorize?${params}`);
+  for (let hop = 0; hop < 10 && REDIRECT_STATUSES.has(res.status); hop++) {
+    const loc = res.headers.get("location");
+    if (!loc || loc.startsWith("skylight-family:")) break;
+    res = await go("GET", absolute(loc));
+  }
+  const csrf = (await res.text()).match(/name="authenticity_token"[^>]*value="([^"]+)"/)?.[1];
+  if (!csrf) throw new Error(`Could not load Skylight login form (status ${res.status})`);
+
+  // 2. Submit credentials and chase redirects to skylight-family://welcome?code=...
+  res = await go("POST", `${SKYLIGHT_BASE}/auth/session`, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ authenticity_token: csrf, email, password }).toString(),
+  });
+  let loc = res.headers.get("location");
+  for (let hop = 0; hop < 8 && loc && !loc.startsWith("skylight-family:"); hop++) {
+    res = await go("GET", absolute(loc));
+    loc = res.headers.get("location");
+  }
+  if (!loc || !loc.startsWith("skylight-family:")) throw new Error("Skylight login rejected (check email/password)");
+  const q = new URL(loc.replace("skylight-family:", "https:")).searchParams;
+  if (q.get("state") !== state) throw new Error("Skylight OAuth state mismatch");
+  const code = q.get("code");
+  if (!code) throw new Error("Skylight authorization code missing");
+
+  // 3. Exchange the code for tokens.
+  const tokenRes = await go("POST", `${SKYLIGHT_BASE}/oauth/token`, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: SKYLIGHT_CLIENT_ID,
+      code,
+      redirect_uri: SKYLIGHT_REDIRECT_URI,
+      code_verifier: verifier,
+    }).toString(),
+  });
+  if (!tokenRes.ok) throw new Error(`Skylight token exchange failed (HTTP ${tokenRes.status})`);
+  const token = (await tokenRes.json())?.access_token;
+  if (!token) throw new Error("Skylight token response had no access_token");
+  return token;
+}
+
+async function skylightApi(token, method, path, body) {
+  const res = await fetch(`${SKYLIGHT_BASE}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "User-Agent": SKYLIGHT_BROWSER_UA,
+      "Skylight-Api-Version": SKYLIGHT_API_VERSION,
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) throw new Error(`Skylight ${method} ${path} -> ${res.status}: ${String(text).slice(0, 200)}`);
+  return data;
+}
+
+// Mirror every configured feed's menu into the Skylight Meals planner.
+export async function syncSkylight(env) {
+  const token = env.SKYLIGHT_ACCESS_TOKEN || (env.SKYLIGHT_EMAIL && env.SKYLIGHT_PASSWORD
+    ? await skylightLogin(env.SKYLIGHT_EMAIL, env.SKYLIGHT_PASSWORD)
+    : null);
+  if (!token) return { skipped: "SKYLIGHT_EMAIL/SKYLIGHT_PASSWORD not set" };
+
+  const feeds = [...readFeeds(env).values()].filter((feed) => !feed.error);
+  if (!feeds.length) return { skipped: "no valid feeds" };
+
+  // Find the frame (the Skylight device/board). Explicit id wins; otherwise the only frame.
+  let frameId = env.SKYLIGHT_FRAME_ID;
+  if (!frameId) {
+    const frames = (await skylightApi(token, "GET", "/api/frames"))?.data ?? [];
+    if (frames.length !== 1) throw new Error(`Set SKYLIGHT_FRAME_ID: found ${frames.length} frames`);
+    frameId = frames[0].id;
+  }
+
+  // Map each Skylight meal category label (lowercased) to its id.
+  const categories = (await skylightApi(token, "GET", `/api/frames/${frameId}/meals/categories`))?.data ?? [];
+  const categoryByLabel = new Map(categories.map((c) => [String(c.attributes?.label ?? "").toLowerCase(), c.id]));
+
+  const timezone = env.TIMEZONE || feeds[0].timezone || "America/New_York";
+  const today = todayInTZ(timezone);
+  const dateMax = addDays(today, DAYS_AHEAD);
+
+  // Everything we want in Skylight after this run: one entry per (feed, date).
+  const desired = new Map(); // key -> { date, categoryId, summary, note }
+  const prefixes = [];
+  for (const feed of feeds) {
+    prefixes.push(feed.eventPrefix);
+    const label = SKYLIGHT_CATEGORY[mealLabel(feed.meal).word] ?? mealLabel(feed.meal).word;
+    const categoryId = categoryByLabel.get(label.toLowerCase());
+    if (!categoryId) {
+      console.warn(`Skylight: no "${label}" meal category for feed "${feed.feedName}"; skipping`);
+      continue;
+    }
+    for (const day of await fetchMenu(feed)) {
+      if (day.date < today || day.date > dateMax) continue;
+      const summary = `${feed.eventPrefix} ${dayTitle(day)}`;
+      const note = dayDescription(day);
+      desired.set(`${categoryId}|${day.date}|${summary}`, { date: day.date, categoryId, summary, note });
+    }
+  }
+
+  // Existing sittings we created (by title prefix), flattened to one record per date.
+  // Skylight's date_max is exclusive, so read a couple of days past dateMax or the last
+  // menu day would never be seen and would be recreated (duplicated) on every run.
+  const readMax = addDays(dateMax, 2);
+  const sittings = (await skylightApi(token, "GET", `/api/frames/${frameId}/meals/sittings?date_min=${today}&date_max=${readMax}`))?.data ?? [];
+  const stale = [];
+  for (const s of sittings) {
+    const summary = s.attributes?.summary ?? "";
+    if (!prefixes.some((p) => summary.startsWith(p))) continue; // leave hand-added meals alone
+    const categoryId = s.relationships?.meal_category?.data?.id;
+    const note = s.attributes?.note ?? "";
+    for (const date of s.attributes?.instances ?? []) {
+      const key = `${categoryId}|${date}|${summary}`;
+      const want = desired.get(key);
+      if (want && want.note === note) desired.delete(key); // already correct, keep it
+      else stale.push({ id: s.id, date }); // ours but changed/removed -> delete
+    }
+  }
+
+  let created = 0;
+  let deleted = 0;
+  for (const { id, date } of stale) {
+    await skylightApi(token, "DELETE", `/api/frames/${frameId}/meals/sittings/${id}/instances/${date}`);
+    deleted++;
+  }
+  for (const { date, categoryId, summary, note } of desired.values()) {
+    await skylightApi(token, "POST", `/api/frames/${frameId}/meals/sittings`, {
+      date,
+      meal_category_id: categoryId,
+      summary,
+      note,
+      saveToRecipeBox: false,
+    });
+    created++;
+  }
+
+  return { frameId, created, deleted, kept: sittings.length - stale.length };
 }
