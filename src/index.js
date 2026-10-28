@@ -8,7 +8,20 @@ const DAYS_AHEAD = 35;
 const CACHE_SECONDS = 3600;
 const FETCH_TIMEOUT_MS = 10_000;
 
-const KEEP_TYPES = { ENTREES: "Entrées", VEGETABLE: "Veggies", "Breads/Grains": "Sides", FRUIT: "Fruit" };
+// The four groups we show, in title/description order, each with its display label.
+const KEEP_TYPES = { ENTREES: "Entrées", VEGETABLE: "Veggies", GRAINS: "Sides", FRUIT: "Fruit" };
+// MealViewer's item_Type naming varies by district: some use "ENTREES"/"Breads/Grains",
+// others "Entree"/"Meatless Entree"/"Grain". Map each to one of the groups above, or null to skip
+// (milk, dessert, condiments). Matching is loose so a new district's wording still lands in a group.
+function classifyType(type) {
+  const t = cleanText(type).toLowerCase();
+  if (!t) return null;
+  if (t.includes("entree") || t.includes("entrée")) return "ENTREES";
+  if (t.includes("vegetable") || t.includes("veggie")) return "VEGETABLE";
+  if (t.includes("fruit")) return "FRUIT";
+  if (t.includes("grain") || t.includes("bread")) return "GRAINS";
+  return null;
+}
 const CONDIMENTS = new Set([
   "ketchup", "mustard", "ranch", "mayo", "mayonnaise", "margarine", "butter",
   "syrup", "salsa", "cream cheese", "sour cream", "jelly", "honey",
@@ -71,7 +84,10 @@ export default {
 
     const cache = caches.default;
     const cacheKey = new Request(`${url.origin}/${config.feedName}.ics`);
-    const cached = await cache.match(cacheKey);
+    // A client sending "Cache-Control: no-cache" (or "Pragma: no-cache") forces a refresh,
+    // so a newly fixed feed can be re-fetched without waiting for the cached copy to expire.
+    const noCache = /no-cache/i.test(`${request.headers.get("Cache-Control") ?? ""} ${request.headers.get("Pragma") ?? ""}`);
+    const cached = noCache ? null : await cache.match(cacheKey);
     if (cached) return cached;
 
     let ics;
@@ -242,7 +258,8 @@ async function fetchMenu(config) {
           theme = titleCase(themeMatch[1]);
           continue;
         }
-        if (name && Object.hasOwn(KEEP_TYPES, item.item_Type)) items.push({ type: item.item_Type, name });
+        const group = classifyType(item.item_Type);
+        if (name && group) items.push({ type: group, name });
       }
     }
 
