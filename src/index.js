@@ -185,11 +185,15 @@ function readFeed(feedName, vars) {
   // can be told apart on one board: "Lincoln Lunch" / "🍽 Lincoln Lunch:".
   const schoolName = String(vars.SCHOOL_NAME ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
   const label = schoolName ? `${schoolName} ${word}` : word;
+  // Feeds push to Skylight Meals by default. SKYLIGHT = false keeps a feed's .ics calendar
+  // but leaves it out of the Skylight sync (set as a bool in wrangler.toml, or "false" as a var).
+  const skylight = !(vars.SKYLIGHT === false || String(vars.SKYLIGHT).toLowerCase() === "false");
   return {
     feedName,
     schoolId,
     meal,
     timezone,
+    skylight,
     calendarName: String(vars.CALENDAR_NAME || (schoolName ? label : `School ${word}`)),
     eventPrefix: String(vars.EVENT_PREFIX || `${emoji} ${label}:`),
   };
@@ -566,8 +570,8 @@ export async function syncSkylight(env) {
     : null);
   if (!token) return { skipped: "SKYLIGHT_EMAIL/SKYLIGHT_PASSWORD not set" };
 
-  const feeds = [...readFeeds(env).values()].filter((feed) => !feed.error);
-  if (!feeds.length) return { skipped: "no valid feeds" };
+  const feeds = [...readFeeds(env).values()].filter((feed) => !feed.error && feed.skylight);
+  if (!feeds.length) return { skipped: "no feeds opted in to Skylight" };
 
   // Find the frame (the Skylight device/board). Explicit id wins; otherwise the only frame.
   let frameId = env.SKYLIGHT_FRAME_ID;
